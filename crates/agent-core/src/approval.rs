@@ -735,6 +735,113 @@ impl Shared {
             .any(|got| got == want)
     }
 
+    /// The URL of a plain navigation: `browser_open` with the `url` field alone, http(s), no
+    /// userinfo, no query, no fragment, and a path that is a short readable page address.
+    /// Such a URL has no room for a value the model copied out of a page or a file: a
+    /// query, a fragment, escapes, long or random-looking segments are all refused. (A short
+    /// readable slug can still say a few words; see the residual risk in the PR.)
+    pub(crate) fn plain_navigation(name: &str, input: &Value) -> Option<url::Url> {
+        if name != "browser_open" || input.as_object().is_none_or(|o| o.len() != 1) {
+            return None;
+        }
+        let url = url::Url::parse(input.get("url")?.as_str()?).ok()?;
+        let plain_path = url.path().len() <= 120
+            && url.path().split('/').count() <= 8
+            && url.path().split('/').all(|seg| {
+                seg.len() <= 48
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+                    // A long run of hex digits is an id or a digest, not a page name.
+                    && !(seg.len() >= 16 && seg.chars().all(|c| c.is_ascii_hexdigit()))
+            });
+        (matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.host_str().is_some()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && plain_path)
+            .then_some(url)
+    }
+
+    /// `host:port` of a navigation, host lower case with no trailing dot.
+    fn nav_site(url: &url::Url) -> Option<(String, u16)> {
+        Some((
+            url.host_str()?.trim_end_matches('.').to_ascii_lowercase(),
+            url.port_or_known_default()?,
+        ))
+    }
+
+    /// A plain navigation (see [`Self::plain_navigation`]) to a site the owner named in this
+    /// chat (a full URL or a bare domain in a message they typed) or already allowed here
+    /// once. It carries no data, so it is not "sending"; every other site still asks.
+    fn plain_navigation_waived(&self, ctx: &RunCtx, name: &str, input: &Value) -> bool {
+        // With private data in the context a path could carry it out: keep asking.
+        if ctx.taint.lock().exposure.has_private() {
+            return false;
+        }
+        let Some(url) = Self::plain_navigation(name, input) else {
+            return false;
+        };
+        let Some(site) = Self::nav_site(&url) else {
+            return false;
+        };
+        let origin = format!("{}://{}:{}", url.scheme(), site.0, site.1);
+        if self
+            .grants
+            .lock()
+            .nav_origin
+            .contains(&(ctx.chat_id, ctx.bot_id, origin))
+        {
+            return true;
+        }
+        let Ok(texts) = self.storage.owner_message_texts(ctx.chat_id) else {
+            return false;
+        };
+        texts
+            .iter()
+            .flat_map(|m| m.split_whitespace())
+            .map(|w| {
+                w.trim_matches([
+                    '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\'',
+                ])
+            })
+            .any(|w| {
+                let (scheme, rest) = match w.split_once("://") {
+                    Some((s, r)) if matches!(s, "http" | "https") => (Some(s), r),
+                    Some(_) => return false,
+                    None => (None, w),
+                };
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                // A bare domain: letters, digits, dots and dashes only, with a real TLD.
+                if scheme.is_none()
+                    && !(authority.contains('.')
+                        && authority
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+                        && authority.rsplit('.').next().is_some_and(|t| {
+                            t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic())
+                        }))
+                {
+                    return false;
+                }
+                let Ok(said) =
+                    url::Url::parse(&format!("{}://{authority}", scheme.unwrap_or("https")))
+                else {
+                    return false;
+                };
+                // Userinfo in what the owner wrote is not a plain site name.
+                if !said.username().is_empty() || said.password().is_some() {
+                    return false;
+                }
+                // A site named with https is never used over plain http.
+                Self::nav_site(&said) == Some(site.clone())
+                    && (said.scheme() == url.scheme()
+                        || (scheme.is_none() && url.scheme() == "https"))
+            })
+    }
+
     /// A call that only the taint gate (not the policy, not an always-ask tool, not a floor)
     /// makes ask, on a bot whose level allows it: the card may offer "always for this chat".
     pub(crate) fn gate_grantable(
@@ -780,7 +887,7 @@ impl Shared {
         if ctx.initiator != InitiatorKind::Human {
             return false;
         }
-        if self.user_typed_url(ctx, name, input) {
+        if self.user_typed_url(ctx, name, input) || self.plain_navigation_waived(ctx, name, input) {
             return true;
         }
         Self::gate_key(name, input, ctx.page_origin.lock().as_deref()).is_some_and(
@@ -2144,6 +2251,18 @@ impl ExecPermit {
                     dest,
                 ));
             }
+        }
+        // Approving a plain navigation to a new site remembers that site for this chat, for plain
+        // navigation only (a query or a form still asks): the owner said yes to this site once.
+        if self.ctx.initiator == InitiatorKind::Human
+            && let Some(url) = Shared::plain_navigation(&self.name, &self.input)
+            && let Some((host, port)) = Shared::nav_site(&url)
+        {
+            self.sh.grants.lock().nav_origin.insert((
+                self.ctx.chat_id,
+                self.ctx.bot_id,
+                format!("{}://{host}:{port}", url.scheme()),
+            ));
         }
         // "Always" on a site's gate card remembers that origin for the bot (owner-confirmed).
         if gate_grant

@@ -3291,3 +3291,99 @@ async fn an_imported_user_row_with_a_url_never_waives_the_taint_approval() {
         }
     }
 }
+
+/// Runs `fs_read` of an untrusted page, then one `browser_open` of `url`, in a chat where the
+/// owner wrote `said`. Returns whether the open ran without a card.
+async fn plain_open_runs_silently(said: &str, url: &str, private: bool) -> bool {
+    let env = setup();
+    let class = if private {
+        ContentClass::untrusted_private()
+    } else {
+        ContentClass::untrusted()
+    };
+    let page = read_tool("fs_read", class);
+    let open = open_tool();
+    let fake = Fake::new(vec![
+        calls(&[("c1", "fs_read", json!({"path": "page.html"}))]),
+        calls(&[("c2", "browser_open", json!({ "url": url }))]),
+        text("done"),
+    ]);
+    let lp = make_loop(
+        &env.storage,
+        env.bot,
+        &fake,
+        &[t(&page), t(&open)],
+        profile(""),
+        cfg(Policy::full()),
+    );
+    let mut rx = lp.subscribe();
+    let run = lp
+        .send_user_message_from(env.chat, said, crate::MessageMode::Steer, "owner")
+        .map(|d| match d {
+            crate::Delivery::NewTurn(r) => r,
+            _ => unreachable!(),
+        })
+        .unwrap();
+    let ev = until(&mut rx, |e| {
+        matches!(e, Event::ApprovalNeeded(_) | Event::RunFinished(_))
+    })
+    .await;
+    if matches!(ev, Event::ApprovalNeeded(_)) {
+        assert_eq!(open.count.load(Ordering::SeqCst), 0, "{url}: asked but ran");
+        lp.cancel(run).unwrap();
+        false
+    } else {
+        assert_eq!(open.count.load(Ordering::SeqCst), 1, "{url}");
+        true
+    }
+}
+
+#[tokio::test]
+async fn plain_navigation_to_a_named_site_is_silent_after_a_page_was_read() {
+    let said = "look at webioo.com.tr and tell me what they sell";
+    for url in [
+        "https://webioo.com.tr/",
+        "https://webioo.com.tr/referanslarimiz",
+        "https://WEBIOO.com.tr./iletisim",
+    ] {
+        assert!(plain_open_runs_silently(said, url, false).await, "{url}");
+    }
+    // a full URL the owner wrote names its site too (http stays http only)
+    assert!(
+        plain_open_runs_silently(
+            "see https://a.example/start",
+            "https://a.example/about",
+            false
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn navigation_that_could_carry_page_data_or_leave_the_named_site_still_asks() {
+    let said = "look at webioo.com.tr please";
+    for url in [
+        // tainted value in the query, the path, the fragment
+        "https://webioo.com.tr/?q=SECRET",
+        "https://webioo.com.tr/#SECRET",
+        "https://webioo.com.tr/c2VjcmV0LXRva2VuLWZyb20tdGhlLXBhZ2UtYWJjZGVmZ2hpams",
+        "https://webioo.com.tr/%73ecret",
+        "https://webioo.com.tr/0123456789abcdef0123456789abcdef",
+        // another site, a lookalike, userinfo and punycode tricks, a downgrade
+        "https://evil.example/",
+        "https://webioo.com.tr.evil.example/",
+        "https://webioo.com.tr@evil.example/",
+        "https://webioo.com.tr:pw@webioo.com.tr/",
+        "https://xn--webio-9ua.com.tr/",
+        "http://webioo.com.tr:8080/",
+        "http://webioo.com.tr/",
+        "ftp://webioo.com.tr/",
+    ] {
+        // `http://webioo.com.tr/` has no scheme in the owner's words, so only https is named
+        assert!(!plain_open_runs_silently(said, url, false).await, "{url}");
+    }
+    // private data in the context: even a named site asks
+    assert!(!plain_open_runs_silently(said, "https://webioo.com.tr/iletisim", true).await);
+    // a site only the page mentions is not named by the owner
+    assert!(!plain_open_runs_silently("read page.html", "https://webioo.com.tr/", false).await);
+}
