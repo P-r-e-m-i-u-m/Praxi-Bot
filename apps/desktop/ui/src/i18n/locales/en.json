@@ -5363,6 +5363,7 @@
       "description": "Select the display language for the interface.",
       "en": "English",
       "es": "Español",
+      "fr": "Français",
       "title": "Language",
       "tr": "Türkçe"
     },

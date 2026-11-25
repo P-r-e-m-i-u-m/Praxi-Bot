@@ -34,7 +34,7 @@ import { BrainStep } from "./firstrun/BrainStep";
 import { FreedomStep } from "./firstrun/FreedomStep";
 import styles from "./firstrun/FirstRun.module.css";
 
-const LANGUAGES: readonly SupportedLanguage[] = ["en", "tr", "de", "es"];
+const LANGUAGES: readonly SupportedLanguage[] = ["en", "tr", "de", "es", "fr"];
 
 export interface OnboardingViewProps {
   settings: AppSettings;
