@@ -119,6 +119,20 @@ test("the stage element carries no key handlers and a forwarded key stops bubbli
   assert.equal(events.length, 2);
 });
 
+test("the remote stage suppresses the browser context menu so only the remote menu shows", () => {
+  const { ctl } = harness();
+  const stage = ctl.stage as unknown as Props;
+  let bubbled = false;
+  const parent: Props = {
+    onContextMenu: () => {
+      bubbled = true;
+    }
+  };
+  const { defaultPrevented } = dispatch([stage, parent], "onContextMenu", {});
+  assert.equal(defaultPrevented, true);
+  assert.equal(bubbled, false, "the event stops at the stage, never reaching an enclosing app menu");
+});
+
 test("clicking the local toolbar never becomes remote pointer input", () => {
   const { events, ctl } = harness();
   const stage = ctl.stage as unknown as Props;

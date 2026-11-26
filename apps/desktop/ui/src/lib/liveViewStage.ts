@@ -90,6 +90,7 @@ export interface StageHandlers {
     onPointerUp: Handler<StagePointerEvent>;
     onPointerCancel: Handler<StagePointerEvent>;
     onWheel: Handler<StageWheelEvent>;
+    onContextMenu: Handler<StageEventBase>;
     onMouseDown: Handler<StageEventBase>;
   };
   ime: {
@@ -324,6 +325,12 @@ export function createStageController(getDeps: () => StageDeps): StageHandlers {
       onPointerUp,
       onPointerCancel,
       onWheel,
+      // The right-click is forwarded to the remote desktop, which draws its own
+      // context menu. Suppress the browser's menu on the frame so only one shows.
+      onContextMenu: (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      },
       onMouseDown: (e) => {
         const d = getDeps();
         if (d.isInteractive()) {
